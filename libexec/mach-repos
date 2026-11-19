@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+# mach-summary: Git repos on this machine against the shared manifest (repos/repos.toml): status and manifest checks
+# mach-group: upkeep
+# mach-subcommands: status doctor
+# mach-writes: no
+# mach-flag: --machine | status: show the repos assigned to this machine name | this machine (MACH_HOST, MACH_MACHINE, ~/.config/mach/machine-id, then the host name)
+# mach-flag: --fetch | status: run git fetch --prune in each present clone first (network; changes remote-tracking refs only) | off
+# mach-usage: mach repos status [--machine NAME] [--fetch] [--json]
+# mach-usage: mach repos doctor [--json]
+# mach-help: The manifest ~/machine-flows/repos/repos.toml (synced to every machine) lists each git repo with its folder, remote and the
+# mach-help: machines that carry it, and the non-git folders Syncthing may carry. Org repos live in ~/na/repos/<name>.
+# mach-help: status reads each clone on this machine and never changes it (no index refresh, no fetch unless --fetch): present, missing,
+# mach-help: at a legacy path, dirty, ahead, behind, diverged, detached, merge or rebase in progress, remote differs from the manifest.
+# mach-help: doctor lints the manifest (credentials in a remote, duplicate or unsafe paths, org repos outside ~/na/repos, a repo inside a
+# mach-help: synced folder, a .git inside a synced folder). Exit 0 OK, 1 warnings or repos needing attention, 2 failure.
+import argparse
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.environ.get('MACH_HOME') or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'lib'))
+import mach_common as mc  # noqa: E402
+import mach_repos as mr  # noqa: E402
+
+
+def load_or_die():
+    p = mr.manifest_path()
+    try:
+        return mr.load(p), p
+    except OSError as e:
+        mc.die('cannot read %s: %s' % (mc.tilde(p), e.strerror or e), mc.EXIT_FAIL)
+    except ValueError as e:
+        mc.die('%s is not valid TOML: %s' % (mc.tilde(p), e), mc.EXIT_FAIL)
+
+
+def cmd_doctor(a):
+    data, p = load_or_die()
+    results = mr.lint(data) + mr.check_folders(data, machine=mr.identity())
+    if not results:
+        results = [('OK', 'manifest valid')]
+    if a.json or mc.env_flag('MACH_JSON'):
+        mc.emit_json({'manifest': mc.tilde(p), 'results': [{'level': x, 'message': y} for x, y in results]})
+    else:
+        for lv, msg in results:
+            print('%s repos: %s' % (lv, msg))
+    return 2 if any(x == 'FAIL' for x, _ in results) else 1 if any(x == 'WARN' for x, _ in results) else 0
+
+
+def summary(r):
+    if r['state'] == 'present':
+        ab = '' if r['ahead'] is None else ' +%d/-%d' % (r['ahead'], r['behind'])
+        return '%s%s' % (r['branch'] or 'detached', ab)
+    if r['state'] == 'legacy':
+        return 'at %s' % r['found_at']
+    return ''
+
+
+def cmd_status(a):
+    data, p = load_or_die()
+    lint_fail = [m for lv, m in mr.lint(data) if lv == 'FAIL']
+    if lint_fail:
+        mc.die('manifest has failures (run: mach repos doctor): %s' % lint_fail[0], mc.EXIT_FAIL)
+    machine = a.machine or mr.identity()
+    rows = []
+    for name, spec in mr.repos_for(data, machine):
+        r = mr.inspect(spec, fetch=a.fetch)
+        r['name'] = name
+        r['class'] = spec.get('class')
+        r['sync'] = spec.get('sync', 'auto')
+        rows.append(r)
+    attention = [r for r in rows if r['state'] in ('missing', 'legacy', 'not-git') or r['problems']]
+    known = mr.known_machines(data)
+    unknown = machine not in known
+    if a.json or mc.env_flag('MACH_JSON'):
+        mc.emit_json({'machine': machine, 'machine_known': not unknown, 'known_machines': known, 'manifest': mc.tilde(p), 'repos': rows})
+    else:
+        print('machine %s, manifest %s' % (machine, mc.tilde(p)))
+        if unknown:
+            print('this machine name is not named in the manifest (known: %s); set MACH_HOST or the [machines.match] config' % ', '.join(known))
+        elif not rows:
+            print('no repos assigned to this machine')
+        for r in rows:
+            note = '; '.join(r['problems'])
+            print('%-24s %-10s %-22s %s' % (r['name'], r['state'], summary(r), note))
+        print('%d repos, %d need attention' % (len(rows), len(attention)))
+    return 1 if attention or unknown else 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog='mach repos')
+    sub = ap.add_subparsers(dest='cmd')
+    st = sub.add_parser('status')
+    st.add_argument('--machine')
+    st.add_argument('--fetch', action='store_true')
+    st.add_argument('--json', action='store_true')
+    dr = sub.add_parser('doctor')
+    dr.add_argument('--json', action='store_true')
+    a = ap.parse_args(argv)
+    if a.cmd == 'status':
+        return cmd_status(a)
+    if a.cmd == 'doctor':
+        return cmd_doctor(a)
+    ap.print_help()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

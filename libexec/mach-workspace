@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+# mach-summary: Manage local machine-flows workspace roots and select the default for mach
+# mach-group: upkeep
+# mach-subcommands: list add join use status leave
+# mach-writes: yes add=yes join=yes use=yes leave=yes
+# mach-usage: mach workspace list [--json]
+# mach-usage: mach workspace add NAME PATH [--kind personal|group] [--apply]
+# mach-usage: mach workspace join NAME PATH [--kind personal|group] [--apply]
+# mach-usage: mach workspace use NAME [--apply]
+# mach-usage: mach workspace status [NAME] [--json]
+# mach-usage: mach workspace leave NAME [--apply]
+# mach-flag: --apply | add/join/use/leave: write the local registry after preview | preview
+# mach-flag: --kind | classify an added/joined workspace | personal for add; group for join
+# mach-flag: --json | list/status: print structured local data | off
+# mach-help: Registry is local and unsynced at ~/.config/mach/workspaces.json (or $MACH_WORKSPACES_FILE).
+# mach-help: add previews an existing directory; --apply records it without copying, cloning or configuring Syncthing. Names are local labels.
+# mach-help: join registers an existing local folder as a separate workspace and makes it active. leave removes only the local registry entry;
+# mach-help: it never deletes workspace files or changes Git, Syncthing or Tailscale.
+# mach-help: use selects the default root; a workspace containing the current directory takes precedence. Explicit MACH_MF_ROOT overrides both.
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import mach_workspace as mw  # noqa: E402
+
+
+def save(path, data):
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    if os.path.islink(path):
+        raise ValueError("refusing to replace a symlinked registry: %s" % path)
+    fd, temp = tempfile.mkstemp(prefix=".workspaces.", dir=parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="mach workspace")
+    sub = ap.add_subparsers(dest="command", required=True)
+    listing = sub.add_parser("list")
+    listing.add_argument("--json", action="store_true")
+    add = sub.add_parser("add")
+    add.add_argument("name")
+    add.add_argument("path")
+    add.add_argument("--kind", choices=("personal", "group"), default="personal")
+    add.add_argument("--apply", action="store_true")
+    join = sub.add_parser("join")
+    join.add_argument("name")
+    join.add_argument("path")
+    join.add_argument("--kind", choices=("personal", "group"), default="group")
+    join.add_argument("--apply", action="store_true")
+    use = sub.add_parser("use")
+    use.add_argument("name")
+    use.add_argument("--apply", action="store_true")
+    status = sub.add_parser("status")
+    status.add_argument("name", nargs="?")
+    status.add_argument("--json", action="store_true")
+    leave = sub.add_parser("leave")
+    leave.add_argument("name")
+    leave.add_argument("--apply", action="store_true")
+    args = ap.parse_args(argv)
+    path = mw.registry_path()
+    try:
+        data = mw.load(path)
+        if args.command == "list":
+            if args.json or os.environ.get("MACH_JSON"):
+                print(json.dumps({"registry": path, **data}, indent=2))
+            else:
+                if not data["workspaces"]:
+                    print("No workspaces registered. Add an existing folder with: mach workspace add NAME PATH")
+                for item in data["workspaces"]:
+                    marker = "*" if item["name"] == data.get("active") else " "
+                    print("%s %-18s %-8s %s" % (marker, item["name"], item.get("kind", "personal"), item["path"]))
+                print("registry: %s" % path)
+            return 0
+        if args.command == "status":
+            items = data["workspaces"]
+            if args.name:
+                items = [item for item in items if item.get("name") == args.name]
+                if not items:
+                    raise ValueError("unknown workspace: %s (run mach workspace list)" % args.name)
+            rows = []
+            for item in items:
+                root = item.get("path", "")
+                exists = os.path.isdir(root)
+                rows.append({"name": item.get("name"), "path": root, "active": item.get("name") == data.get("active"),
+                             "exists": exists, "git": os.path.exists(os.path.join(root, ".git")) if exists else False})
+            if args.json or os.environ.get("MACH_JSON"):
+                print(json.dumps({"registry": path, "workspaces": rows}, indent=2))
+            elif not rows:
+                print("No workspaces registered.")
+            else:
+                for row in rows:
+                    print("%-18s %-7s %-10s %s" % (row["name"], "active" if row["active"] else "", "ready" if row["exists"] else "missing", row["path"]))
+                    if row["exists"]:
+                        print("  Git repository: %s" % ("yes" if row["git"] else "no"))
+            return 1 if any(not row["exists"] for row in rows) else 0
+        if args.command in ("add", "join"):
+            if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$", args.name):
+                raise ValueError("name must start with a letter or number and contain only letters, numbers, dot, underscore or dash")
+            workspace = os.path.realpath(os.path.abspath(os.path.expanduser(args.path)))
+            if not os.path.isdir(workspace):
+                raise ValueError("workspace directory does not exist: %s" % workspace)
+            if any(item.get("name") == args.name for item in data["workspaces"]):
+                raise ValueError("workspace name already exists: %s" % args.name)
+            if any(item.get("path") == workspace for item in data["workspaces"]):
+                raise ValueError("workspace path is already registered")
+            for item in data["workspaces"]:
+                other = os.path.realpath(item.get("path", ""))
+                if other and (workspace.startswith(other + os.sep) or other.startswith(workspace + os.sep)):
+                    raise ValueError("workspace roots must not be nested: %s and %s" % (workspace, other))
+            data["workspaces"].append({"name": args.name, "path": workspace, "kind": args.kind})
+            if args.command == "join" or data.get("active") is None:
+                data["active"] = args.name
+            dry = os.environ.get("MACH_DRY_RUN", "").lower() not in ("", "0", "false", "no", "off")
+            apply = args.apply and not dry
+            if apply:
+                save(path, data)
+                print("%s %s (%s): %s" % ("joined" if args.command == "join" else "registered", args.name, args.kind, workspace))
+            else:
+                print("would register %s (%s): %s" % (args.name, args.kind, workspace))
+            if data["active"] == args.name:
+                print("would select as the default mach workspace" if not apply else "selected as the default mach workspace")
+            if not apply:
+                print("preview only: add --apply to write the local registry")
+            return 0
+        if args.command == "leave":
+            matches = [row for row in data["workspaces"] if row.get("name") == args.name]
+            if not matches:
+                raise ValueError("unknown workspace: %s" % args.name)
+            dry = os.environ.get("MACH_DRY_RUN", "").lower() not in ("", "0", "false", "no", "off")
+            apply = args.apply and not dry
+            if apply:
+                data["workspaces"] = [row for row in data["workspaces"] if row.get("name") != args.name]
+                if data.get("active") == args.name:
+                    data["active"] = data["workspaces"][0]["name"] if data["workspaces"] else None
+                save(path, data)
+                print("removed %s from the local registry; workspace files and sharing are unchanged" % args.name)
+            else:
+                print("would remove %s from the local registry only; workspace files and sharing are unchanged" % args.name)
+                print("preview only: add --apply to write the local registry")
+            return 0
+        if args.command == "use":
+            if not any(item.get("name") == args.name for item in data["workspaces"]):
+                raise ValueError("unknown workspace: %s (run mach workspace list)" % args.name)
+            dry = os.environ.get("MACH_DRY_RUN", "").lower() not in ("", "0", "false", "no", "off")
+            apply = args.apply and not dry
+            if apply:
+                data["active"] = args.name
+                save(path, data)
+                print("selected %s; mach commands will use its root unless MACH_MF_ROOT is set" % args.name)
+            else:
+                print("would select %s; mach commands will use its root unless MACH_MF_ROOT is set" % args.name)
+                print("preview only: add --apply to write the local registry")
+            return 0
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print("mach workspace: %s" % error, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

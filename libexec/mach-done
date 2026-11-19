@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+# mach-summary: Mark a queued handoff run as done
+# mach-group: gateway
+# mach-writes: yes
+# mach-usage: mach done <run_id> [--json]
+# mach-help: Complete a queued handoff after reviewing its return. Refuses non-queued runs.
+# mach-help: Muse runs also close automatically when files/inbox/muse-returns/<run_id>/result.md exists (queue/status).
+import argparse
+import os
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import mach_common as mc
+import mach_runs as mr
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="mach done", add_help=False)
+    ap.add_argument("id")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    try:
+        run = mr.find_run(a.id, mc.load_config_or_warn())
+    except ValueError as exc:
+        mc.die(str(exc))
+    if run is None:
+        mc.die("no run matches %r" % a.id)
+    if run.status != "queued":
+        mc.die("run %s is %s: only queued handoff runs can be marked done" % (run.id, run.status))
+    if not run.meta.get("handoff") and run.meta.get("tool") != "grokbot":
+        mc.die("run %s is not a queued handoff" % run.id)
+    mr.finish_handoff(run)
+    if a.json or mc.env_flag("MACH_JSON"):
+        mc.emit_json({"id": run.id, "status": run.status})
+    else:
+        print("run %s: done" % run.id)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

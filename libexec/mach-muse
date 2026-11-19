@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+# mach-summary: Pull Muse returns from the return repo into the local inbox
+# mach-group: gateway
+# mach-writes: yes
+# mach-usage: mach muse pull [--repo DIR] [--no-fetch] [--json]
+# mach-flag: --repo | return-repo clone to pull | muse.returns_clone (~/.local/share/muse-returns)
+# mach-flag: --no-fetch | copy from the clone without git pull | off
+# mach-help: Runs git pull --ff-only on the return repo clone (muse.returns_clone, default ~/.local/share/muse-returns; MACH_MUSE_RETURNS overrides),
+# mach-help: then copies each returns/<run_id>/ into files/inbox/muse-returns/<run_id>/. Existing files are never overwritten.
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import mach_common as mc
+
+RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def pull(repo, fetch):
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        mc.die("return repo clone not found: %s (set MACH_MUSE_RETURNS or --repo)" % repo)
+    if fetch:
+        r = subprocess.run(["git", "-C", repo, "pull", "--ff-only", "-q"], capture_output=True, text=True)
+        if r.returncode != 0:
+            mc.die("git pull failed in %s: %s" % (repo, (r.stderr or r.stdout).strip()))
+    src_root = os.path.join(repo, "returns")
+    dst_root = os.path.join(mc.mf_root(), "files", "inbox", "muse-returns")
+    copied, skipped, runs = [], [], []
+    if not os.path.isdir(src_root):
+        return copied, skipped, runs
+    for run_id in sorted(os.listdir(src_root)):
+        src = os.path.join(src_root, run_id)
+        if not os.path.isdir(src) or not RUN_ID.match(run_id):
+            continue
+        runs.append(run_id)
+        for base, dirs, files in os.walk(src):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for name in files:
+                s = os.path.join(base, name)
+                if os.path.islink(s):
+                    skipped.append(os.path.relpath(s, src_root))
+                    continue
+                rel = os.path.relpath(s, src_root)
+                d = os.path.join(dst_root, rel)
+                if os.path.exists(d):
+                    skipped.append(rel)
+                    continue
+                os.makedirs(os.path.dirname(d), exist_ok=True)
+                shutil.copy2(s, d)
+                copied.append(rel)
+    return copied, skipped, runs
+
+
+def main():
+    cfg = mc.load_config_or_warn()
+    ap = argparse.ArgumentParser(prog="mach muse", add_help=False)
+    ap.add_argument("action", choices=["pull"])
+    ap.add_argument("--repo", default=os.path.expanduser(os.environ.get("MACH_MUSE_RETURNS")
+                    or cfg.get("muse.returns_clone", "") or "~/.local/share/muse-returns"))
+    ap.add_argument("--no-fetch", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    copied, skipped, runs = pull(a.repo, not a.no_fetch)
+    if a.json or mc.env_flag("MACH_JSON"):
+        mc.emit_json({"runs": runs, "copied": copied, "skipped": skipped})
+    else:
+        print("muse pull: %d run(s), %d file(s) copied, %d kept (already present)" % (len(runs), len(copied), len(skipped)))
+        for c in copied:
+            print("  + " + c)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+# mach-summary: Guided first setup for machine identity, one workspace, optional scans and sync touchpoints
+# mach-group: upkeep
+# mach-writes: yes
+# mach-usage: mach setup [--mode existing|join|create] [--name NAME] [--path PATH] [--kind personal|group]
+# mach-usage: mach setup [--starter GIT-URL] [--machine-id ID] [--sync none|syncthing|tailscale|both]
+# mach-usage: mach setup [--scans all|none|choose] [--categories LIST] [--tracking none|blank] [--apply] [--resume]
+# mach-usage: mach setup [--json-plan]
+# mach-flag: --mode | how to obtain the workspace folder | existing
+# mach-flag: --kind | classify this workspace | personal
+# mach-flag: --starter | create: credential-free Git URL or local Git repo | none
+# mach-flag: --machine-id | user-confirmed local machine name | OS hostname
+# mach-flag: --sync | connection preference; pairing remains manual | none
+# mach-flag: --apply | save local identity/registry and create or join workspace | preview
+# mach-flag: --scans | optional local scan scope | none unless selected
+# mach-flag: --categories | comma-separated scan categories when scans=choose | none
+# mach-flag: --tracking | initialize optional blank tracking sheet set | none
+# mach-flag: --resume | resume values saved before an interrupted apply | off
+# mach-flag: --json-plan | print the complete action plan as JSON | text
+# mach-help: Setup prints a complete action plan (scripts, reads, writes and network use) before asking to apply. create clones the
+# mach-help: explicitly supplied starter into a new folder; join/use-existing
+# mach-help: registers an existing folder. Sync is never configured automatically. No scan results are shared by default.
+# mach-help: --json-plan prints the plan only and never applies it. With a terminal, setup asks for an explicit yes after the plan.
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.parse import urlsplit
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import mach_common as mc  # noqa: E402
+import mach_workspace as mw  # noqa: E402
+
+SCANS = ("system", "packages", "tools", "apps", "ai", "shell", "operations", "workspace", "connections")
+
+
+def atomic_json(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    if os.path.islink(path):
+        raise ValueError("refusing to replace a symlinked setup file: %s" % path)
+    fd, tmp = tempfile.mkstemp(prefix=".mach-setup.", dir=os.path.dirname(path))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def atomic_private_text(path, value):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    if os.path.islink(path):
+        raise ValueError("refusing to replace a symlinked identity file: %s" % path)
+    fd, tmp = tempfile.mkstemp(prefix=".machine-id.", dir=os.path.dirname(path))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(value + "\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def prompt(label, default=""):
+    suffix = " [%s]" % default if default else ""
+    value = input(label + suffix + ": ").strip()
+    return value or default
+
+
+def same_tree(left, right):
+    if not os.path.isdir(left) or not os.path.isdir(right):
+        return False
+    for base, dirs, files in os.walk(left):
+        rel = os.path.relpath(base, left)
+        other = right if rel == "." else os.path.join(right, rel)
+        if not os.path.isdir(other):
+            return False
+        other_dirs = [name for name in os.listdir(other) if os.path.isdir(os.path.join(other, name))]
+        other_files = [name for name in os.listdir(other) if os.path.isfile(os.path.join(other, name))]
+        if sorted(dirs) != sorted(other_dirs) or sorted(files) != sorted(other_files):
+            return False
+        for filename in files:
+            try:
+                with open(os.path.join(base, filename), "rb") as a, open(os.path.join(other, filename), "rb") as b:
+                    if a.read() != b.read():
+                        return False
+            except OSError:
+                return False
+    return True
+
+
+def setup_plan(a, categories, registry_path, state_path, machine_path, tracking_template, personal_root):
+    mach_home = os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    mach = os.path.join(mach_home, "bin", "mach")
+    inventory_script = os.path.join(a.path, "scripts", "inventory-macos.sh" if mc.is_mac() else "inventory-linux.sh")
+    actions = []
+
+    def add(title, mechanism, reads=None, writes=None, network="no", when="during apply", details=None):
+        actions.append({"action": title, "mechanism": mechanism, "reads": reads or [], "writes": writes or [], "network": network, "when": when, "details": details or []})
+
+    add("Validate machine, registry and workspace paths", "mach setup; lib/mach_workspace.py", [registry_path, a.path], [], when="completed before this plan")
+    add("Write resumable setup state (applying before changes, complete after)", "atomic_json in libexec/mach-setup",
+        [state_path], [state_path, os.path.dirname(state_path) + "/ (created mode 700 if missing)", os.path.dirname(state_path) + "/.mach-setup.* (temporary, removed)"],
+        details=["Stores setup choices and applying/complete status; no credentials or scan results."])
+    if a.mode == "create":
+        add("Clone the supplied starter as this workspace's Git repository", "git clone (launched by libexec/mach-setup)",
+            [a.starter], [a.path + "/** (starter tree and .git/)", os.path.dirname(a.path) + "/ (created if missing)", "terminal (git progress)"],
+            "yes for remote Git URLs; local read only for local Git sources",
+            details=["Source: %s" % a.starter, "Target: %s" % a.path, "Clone writes all starter-repository files; exact file list depends on the selected repository/revision."])
+    else:
+        add("Register the existing local workspace; no workspace content is copied", "libexec/mach-setup", [a.path], [])
+    if a.tracking == "blank":
+        template_files = sorted(os.listdir(tracking_template)) if os.path.isdir(tracking_template) else []
+        add("Initialize the bundled blank tracking sheet set", "shutil.copytree in libexec/mach-setup",
+            [tracking_template + "/" + name for name in template_files], [os.path.join(a.path, "tracking") + "/", *[os.path.join(a.path, "tracking", name) for name in template_files]])
+    add("Update local workspace registry, select this workspace and save scan/share/sync preferences (sharing defaults to none)", "atomic_json in libexec/mach-setup",
+        [registry_path], [registry_path, os.path.dirname(registry_path) + "/ (created mode 700 if missing)", os.path.dirname(registry_path) + "/.mach-setup.* (temporary, removed)"],
+        details=["Entry: name=%s, path=%s, kind=%s" % (a.name, a.path, a.kind), "Preferences: scan_categories=%s; share_categories=[]; sync=%s" % (categories, a.sync), "Active workspace: %s" % a.name])
+    add("Save the user-confirmed machine ID", "atomic_private_text in libexec/mach-setup",
+        [machine_path], [machine_path, os.path.dirname(machine_path) + "/ (created mode 700 if missing)", os.path.dirname(machine_path) + "/.machine-id.* (temporary, removed)"],
+        details=["Content: %s plus newline; file mode 600" % a.machine_id])
+
+    planned_scans = list(categories)
+    if a.sync != "none" and "connections" not in planned_scans:
+        planned_scans.append("connections")
+    machine_categories = {"system", "packages", "tools", "apps", "ai", "shell", "operations", "workspace"}
+    staging = os.environ.get("MACH_STAGING") or os.path.join(mc.home(), "machine-flows-staging")
+    temp_write = os.path.join(staging, "tmp", "mach.*", "<machine-id>", "<inventory files>") + " (removed after preview); fallback: $TMPDIR/mach.* and /tmp/inventory.* (removed)"
+    if machine_categories.issubset(set(planned_scans)):
+        add("Preview all selected machine inventory categories (light scan)", "bin/mach inventory --light --diff -> libexec/mach-inventory -> " + inventory_script,
+            [os.path.join(a.path, "inventory", a.machine_id), "local OS, package, app, tool and configuration metadata"],
+            [temp_write, "terminal output (inventory preview/diff)"], "no; light mode skips network checks", "after local setup is applied")
+        add("Preview workspace metadata and tracking-set counts", "bin/mach scan workspace -> libexec/mach-scan",
+            [a.path + " (directory names and index.csv locations only)"], ["terminal output"], when="after local setup is applied")
+        remaining = [name for name in planned_scans if name == "connections"]
+    else:
+        remaining = planned_scans
+    for name in remaining:
+        if name == "connections":
+            add("Check local Syncthing/service health and Tailscale status", "bin/mach scan connections -> libexec/mach-scan -> mach doctor/libexec/mach-doctor; optional tailscale status --json",
+                ["local service state", "Syncthing localhost health API (if configured)", "Tailscale local status (if installed)"], ["terminal output"],
+                "local process/API checks only; no device pairing or configuration", "after local setup is applied")
+        elif name == "workspace":
+            add("Preview workspace inventory section 80", "bin/mach scan machine --category workspace -> libexec/mach-scan -> libexec/mach-inventory -> " + inventory_script,
+                [os.path.join(a.path, "inventory", a.machine_id), "local workflow-folder metadata"], [temp_write, "terminal output (inventory preview/diff)"], "no; light mode skips network checks", "after local setup is applied")
+            add("Preview workspace metadata and tracking-set counts", "bin/mach scan workspace -> libexec/mach-scan",
+                [a.path + " (directory names and index.csv locations only)"], ["terminal output"], when="after local setup is applied")
+        else:
+            section = {"system": "00", "packages": "20", "tools": "30", "apps": "40", "ai": "50", "shell": "60", "operations": "70"}[name]
+            add("Preview scan category: " + name, "bin/mach scan machine --category %s -> libexec/mach-scan -> libexec/mach-inventory -> %s" % (name, inventory_script),
+                [os.path.join(a.path, "inventory", a.machine_id), "local %s metadata" % name], [temp_write, "terminal output (inventory preview/diff)"], "no; light mode skips network checks", "after local setup is applied")
+    if not planned_scans:
+        add("Skip machine and connection scans", "No scan command invoked", [], [])
+    if a.sync != "none":
+        add("Show manual connection instructions for " + a.sync, "libexec/mach-setup (printed guidance only)", [], [], when="after local setup is applied")
+    if personal_root:
+        add("Optional follow-up, not run by setup: index the new local config files", "MACH_MF_ROOT=%s mach docs --apply" % personal_root,
+        [machine_path, registry_path], [os.path.join(personal_root, "inventory", a.machine_id, "docs-index.csv")], when="optional manual follow-up")
+    else:
+        add("Manual follow-up: register a personal workspace before indexing machine-local config files", "No command run by setup",
+            [machine_path, registry_path], [])
+    if a.tracking == "blank":
+        add("Optional follow-up, not run by setup: build the tracking workbook", "mach sheets build " + os.path.join(a.path, "tracking"),
+            [os.path.join(a.path, "tracking", "index.csv"), "tracking CSV files"],
+            [os.path.join(a.path, "tracking", "index.csv"), os.path.join(a.path, "tracking", "tracking.xlsx")], when="optional manual follow-up")
+    return actions
+
+
+def print_plan(actions, as_json=False):
+    if as_json:
+        print(json.dumps({"title": "mach setup action plan", "actions": actions}, indent=2))
+        return
+    print("\nFULL SETUP ACTION PLAN")
+    print("Actions, scripts, reads, writes and network use are listed below. Temporary inventory output is removed after each preview.\n")
+    for number, item in enumerate(actions, 1):
+        print("%d. %s" % (number, item["action"]))
+        print("   Runs: %s" % item["mechanism"])
+        print("   Reads: %s" % ("; ".join(item["reads"]) if item["reads"] else "none"))
+        print("   Writes: %s" % ("; ".join(item["writes"]) if item["writes"] else "none"))
+        for detail in item["details"]:
+            print("   Details: %s" % detail)
+        print("   Network: %s" % item["network"])
+        print("   When: %s" % item["when"])
+
+
+def run_scans(root, names):
+    env = os.environ.copy()
+    env["MACH_MF_ROOT"] = root
+    mach = os.path.join(os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "mach")
+    machine_categories = {"system", "packages", "tools", "apps", "ai", "shell", "operations", "workspace"}
+    if machine_categories.issubset(set(names)):
+        print("\n== scan preview: all machine categories ==")
+        subprocess.call([mach, "inventory", "--light", "--diff"], env=env)
+        subprocess.call([mach, "scan", "workspace"], env=env)
+        names = [name for name in names if name == "connections"]
+    for name in names:
+        print("\n== scan preview: %s ==" % name)
+        if name == "connections":
+            command = [mach, "scan", "connections"]
+        elif name == "workspace":
+            subprocess.call([mach, "scan", "machine", "--category", "workspace"], env=env)
+            command = [mach, "scan", "workspace"]
+        else:
+            command = [mach, "scan", "machine", "--category", name]
+        try:
+            subprocess.call(command, env=env)
+        except OSError as error:
+            print("scan skipped: %s" % error)
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="mach setup")
+    ap.add_argument("--mode", choices=("existing", "join", "create"))
+    ap.add_argument("--name")
+    ap.add_argument("--path")
+    ap.add_argument("--kind", choices=("personal", "group"))
+    ap.add_argument("--starter", help="credential-free Git URL or local Git repository for --mode create")
+    ap.add_argument("--machine-id")
+    ap.add_argument("--sync", choices=("none", "syncthing", "tailscale", "both"))
+    ap.add_argument("--scans", choices=("all", "none", "choose"))
+    ap.add_argument("--categories", help="comma-separated names from mach scan catalog (used with --scans choose)")
+    ap.add_argument("--tracking", choices=("none", "blank"))
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--json-plan", action="store_true")
+    a = ap.parse_args(argv)
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(mc.home(), ".config")
+    state_path = os.path.join(config, "mach", "setup-state.json")
+    machine_path = os.path.join(config, "mach", "machine-id")
+    try:
+        if a.resume:
+            with open(state_path, encoding="utf-8") as stream:
+                saved = json.load(stream)
+            for key in ("mode", "name", "path", "kind", "starter", "machine_id", "sync", "scans", "tracking"):
+                if getattr(a, key, None) is None and saved.get(key) is not None:
+                    setattr(a, key, saved[key])
+            if a.scans == "choose" and not a.categories:
+                a.categories = ",".join(saved.get("categories", []))
+        if a.json_plan and a.apply:
+            raise ValueError("--json-plan is preview-only; remove it to apply the plan")
+        if not a.mode:
+            if sys.stdin.isatty():
+                print("1 existing folder  2 join a folder already shared with you  3 create from a Git starter")
+                mode = prompt("Choose", "1")
+                a.mode = {"1": "existing", "2": "join", "3": "create"}.get(mode, mode)
+            else:
+                a.mode = "existing"
+        if a.mode not in ("existing", "join", "create"):
+            raise ValueError("mode must be existing, join or create")
+        a.name = a.name or (prompt("Workspace name", "personal") if sys.stdin.isatty() else "personal")
+        a.path = os.path.realpath(os.path.abspath(os.path.expanduser(a.path or (prompt("Workspace folder", "~/machine-flows") if sys.stdin.isatty() else "~/machine-flows"))))
+        if sys.stdin.isatty() and a.kind is None:
+            a.kind = prompt("Workspace type (personal/group)", "personal").lower()
+        a.kind = a.kind or "personal"
+        if a.kind not in ("personal", "group"):
+            raise ValueError("workspace type must be personal or group")
+        try:
+            with open(machine_path, encoding="utf-8") as stream:
+                current_machine_id = stream.read().strip()
+        except OSError:
+            current_machine_id = os.environ.get("MACH_MACHINE") or os.environ.get("MACH_HOST") or mc.host()
+        a.machine_id = a.machine_id or (prompt("Machine ID", current_machine_id) if sys.stdin.isatty() else current_machine_id)
+        a.sync = a.sync or (prompt("Connection preference (none/syncthing/tailscale/both)", "none").lower() if sys.stdin.isatty() else "none")
+        if a.sync not in ("none", "syncthing", "tailscale", "both"):
+            raise ValueError("sync preference must be none, syncthing, tailscale or both")
+        if a.mode == "create" and not a.starter and sys.stdin.isatty():
+            a.starter = prompt("Starter Git URL")
+        if a.mode == "create" and not a.starter:
+            raise ValueError("--mode create requires --starter GIT-URL")
+        if a.mode == "create":
+            local_starter = os.path.realpath(os.path.expanduser(a.starter))
+            if os.path.isdir(local_starter):
+                if not os.path.isdir(os.path.join(local_starter, ".git")):
+                    raise ValueError("local starter must be a Git repository: %s" % local_starter)
+                a.starter = local_starter
+        if a.mode == "create" and a.starter.startswith(("http://", "https://")):
+            parsed = urlsplit(a.starter)
+            if parsed.username or parsed.password or parsed.query:
+                raise ValueError("starter URL must not contain credentials or query parameters; use credential-free Git URLs and your Git credential manager")
+        if a.scans is None:
+            if sys.stdin.isatty():
+                print("Scans: all, choose categories, or skip all.")
+                a.scans = prompt("Scan scope", "none").lower()
+            else:
+                a.scans = "none"
+        if a.scans not in ("all", "none", "choose"):
+            raise ValueError("scan scope must be all, choose or none")
+        if a.tracking is None:
+            a.tracking = prompt("Initialize blank tracking templates? (none/blank)", "none").lower() if sys.stdin.isatty() else "none"
+        if a.tracking not in ("none", "blank"):
+            raise ValueError("tracking choice must be none or blank")
+        categories = []
+        if a.scans == "all":
+            categories = list(SCANS)
+        elif a.scans == "choose":
+            raw = a.categories
+            if raw is None and sys.stdin.isatty():
+                print("Available: " + ", ".join(SCANS))
+                raw = prompt("Comma-separated categories", "")
+            categories = [name.strip() for name in (raw or "").split(",") if name.strip()]
+            unknown = sorted(set(categories) - set(SCANS))
+            if unknown:
+                raise ValueError("unknown scan categories: %s" % ", ".join(unknown))
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", a.name):
+            raise ValueError("workspace name must contain letters, numbers, dot, underscore or dash")
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", a.machine_id):
+            raise ValueError("machine ID must contain letters, numbers, dot, underscore or dash")
+        state = {"mode": a.mode, "name": a.name, "path": a.path, "kind": a.kind, "starter": a.starter,
+                 "machine_id": a.machine_id, "sync": a.sync, "scans": a.scans, "tracking": a.tracking,
+                 "categories": categories, "status": "planned"}
+        registry_path = mw.registry_path()
+        registry = mw.load(registry_path)
+        config_real = os.path.realpath(config)
+        for local_path in (config_real, os.path.realpath(registry_path)):
+            if local_path == a.path or local_path.startswith(a.path + os.sep) or a.path.startswith(local_path + os.sep):
+                raise ValueError("mach registry and identity must stay outside the workspace: %s" % local_path)
+        active_match = next((row for row in registry["workspaces"] if row.get("name") == a.name or row.get("path") == a.path), None)
+        if active_match and (active_match.get("name") != a.name or active_match.get("path") != a.path):
+            raise ValueError("workspace name or path already belongs to %s" % active_match.get("name"))
+        for row in registry["workspaces"]:
+            existing = os.path.realpath(row.get("path", ""))
+            if existing and existing != a.path and (a.path.startswith(existing + os.sep) or existing.startswith(a.path + os.sep)):
+                raise ValueError("workspace roots must not be nested: %s and %s" % (a.path, existing))
+        if a.mode in ("existing", "join") and not os.path.isdir(a.path):
+            raise ValueError("workspace directory does not exist: %s" % a.path)
+        if a.mode == "create" and os.path.exists(a.path) and not (a.resume and os.path.isdir(os.path.join(a.path, ".git"))):
+            raise ValueError("create target already exists: %s" % a.path)
+        tracking_path = os.path.join(a.path, "tracking")
+        tracking_template = os.path.join(os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "templates", "tracking")
+        tracking_already = os.path.exists(tracking_path)
+        if a.tracking == "blank" and tracking_already and not (a.resume and same_tree(tracking_path, tracking_template)):
+            raise ValueError("tracking folder already exists; setup will not overwrite or merge it")
+        personal_root = a.path if a.kind == "personal" else next((row.get("path") for row in registry["workspaces"] if row.get("kind") == "personal" and os.path.isdir(row.get("path", ""))), None)
+        actions = setup_plan(a, categories, registry_path, state_path, machine_path, tracking_template, personal_root)
+        if not a.json_plan:
+            print("mach setup plan for %s (%s) at %s; machine ID %s" % (a.name, a.kind, a.path, a.machine_id))
+            print("scan selection: %s; tracking: %s; connection preference: %s" % (
+                ", ".join(categories) if categories else "none", a.tracking, a.sync))
+        print_plan(actions, a.json_plan)
+        if a.json_plan:
+            return 0
+        should_apply = a.apply
+        if sys.stdin.isatty() and not mc.env_flag("MACH_DRY_RUN"):
+            answer = prompt("Apply the complete plan shown above? (yes/no)", "no").lower()
+            should_apply = answer in ("yes", "y")
+        if not should_apply or mc.env_flag("MACH_DRY_RUN"):
+            print("preview only; rerun with --apply (or --resume --apply) to save identity and workspace preferences")
+            return 0
+        atomic_json(state_path, dict(state, status="applying"))
+        if a.mode == "create":
+            if os.path.isdir(os.path.join(a.path, ".git")) and a.resume:
+                check = subprocess.run(["git", "-C", a.path, "rev-parse", "--verify", "HEAD"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                if check.returncode:
+                    raise RuntimeError("starter clone is incomplete at %s; inspect it before resuming" % a.path)
+                print("resuming from the cloned starter already present")
+            else:
+                os.makedirs(os.path.dirname(a.path), exist_ok=True)
+                result = subprocess.run(["git", "clone", a.starter, a.path], check=False, timeout=600)
+                if result.returncode:
+                    raise RuntimeError("git clone failed with exit code %d; setup state saved for --resume" % result.returncode)
+        if a.tracking == "blank" and not tracking_already:
+            shutil.copytree(tracking_template, tracking_path)
+        workspace = os.path.realpath(a.path)
+        entry = {"name": a.name, "path": workspace, "kind": a.kind,
+                 "preferences": {"scan_categories": categories, "share_categories": [], "sync": a.sync}}
+        if active_match:
+            entry = dict(active_match, **entry)
+            registry["workspaces"] = [entry if row.get("name") == active_match.get("name") else row for row in registry["workspaces"]]
+        else:
+            registry["workspaces"].append(entry)
+        registry["active"] = a.name
+        atomic_json(registry_path, registry)
+        atomic_private_text(machine_path, a.machine_id)
+        atomic_json(state_path, dict(state, status="complete"))
+        print("saved local workspace registry and machine ID; scan results remain local")
+        if a.sync in ("syncthing", "both"):
+            print("Syncthing: install/start it, approve the device on a peer, share this workspace as its own folder, and exclude .git.")
+        if a.sync in ("tailscale", "both"):
+            print("Tailscale: sign into the intended tailnet on each peer; verify `mach scan connections` before remote SSH paths.")
+        if personal_root:
+            print("Record the local config files in your personal workspace with: MACH_MF_ROOT=%s mach docs --apply" % personal_root)
+        else:
+            print("No personal workspace is registered; add one before indexing these machine-local config files.")
+        if a.tracking == "blank":
+            print("Build the optional tracker workbook with `mach sheets build %s/tracking` when wanted." % a.path)
+        chosen_scans = list(categories)
+        if a.sync != "none" and "connections" not in chosen_scans:
+            chosen_scans.append("connections")
+        if chosen_scans:
+            run_scans(workspace, chosen_scans)
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError, RuntimeError, subprocess.SubprocessError) as error:
+        print("mach setup: %s" % error, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

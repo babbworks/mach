@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+# mach-summary: Backfill files/runs/index.csv from run records and legacy codex runs
+# mach-group: gateway
+# mach-subcommands: reindex
+# mach-status: working
+# mach-writes: yes reindex=yes
+# mach-usage: mach runs reindex [--apply] [--json]
+# mach-help: Appends missing rows to files/runs/index.csv (plain CSV, not a sheet set). Preview by default;
+# mach-help: --apply appends under a file lock and never rewrites or deletes existing rows or source records.
+# mach-help: Sources: files/runs/**/run.* (done/failed/cancelled) and ~/na/runs/codex-runs/*.{md,log} (tool=codex;
+# mach-help: status=unknown when not derivable). Same run_id+status already in the index is skipped.
+# mach-help: Columns: run_id,date,machine,tool,model,repo,linear_issue,requester,status,duration,link.
+import argparse
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+
+import mach_common as mc  # noqa: E402
+import mach_run_index as ri  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="mach runs", add_help=False)
+    ap.add_argument("sub", choices=["reindex"])
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--yes", "-y", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    cfg = mc.load_config_or_warn()
+    js = a.json or mc.env_flag("MACH_JSON")
+    apply = bool(a.apply or a.yes) and not a.dry_run and not mc.env_flag("MACH_DRY_RUN")
+    result = ri.reindex(apply=apply, cfg=cfg)
+    if js:
+        payload = {
+            "index": result["index"],
+            "would_append": result["would_append"],
+            "appended": result["appended"],
+            "skipped": result["skipped"],
+            "apply": apply,
+            "rows": result["rows"] if not apply else result["rows"][:50],
+        }
+        mc.emit_json(payload)
+        return 0
+    print("run index: %s" % result["index"])
+    print("missing rows: %d" % result["would_append"])
+    if not apply:
+        for row in result["rows"][:20]:
+            print("  would append  %s  %s  %s  %s" % (
+                row.get("run_id", ""), row.get("status", ""), row.get("tool", ""), row.get("linear_issue", "")))
+        if result["would_append"] > 20:
+            print("  ... and %d more" % (result["would_append"] - 20))
+        print("preview only: run `mach runs reindex --apply` to append (never rewrites existing rows).")
+        return 0
+    print("appended: %d" % result["appended"])
+    if result["skipped"]:
+        print("skipped (already present): %d" % result["skipped"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

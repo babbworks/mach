@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# mach-summary: Check prerequisites and link mach; point to guided workspace setup and previews
+# mach-group: upkeep
+# mach-flag: --skip-previews | skip the inventory, names, ai and mcp previews | off
+# mach-usage: mach onboard [--apply] [--skip-previews]
+# mach-help: Checks prerequisites (bash, python3 >= 3.9, git; syncthing and tmux are optional), that ~/.local/bin is on PATH, and whether mach
+# mach-help: is linked. Prints manual sync guidance (mach never touches Syncthing). Then runs, in PREVIEW mode:
+# mach-help: mach inventory, mach names, mach ai apply, mach mcp render (--skip-previews skips them; inventory can take a while).
+# mach-help: --apply performs ONE change: it runs install.sh --apply to link ~/.local/bin/mach -> <this checkout>/bin/mach.
+# mach-help: Exit codes: 0 all prerequisites met, 1 something optional/missing, 2 a hard prerequisite is missing.
+set -u
+MACH_HOME=${MACH_HOME:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+# shellcheck source=/dev/null
+. "$MACH_HOME/lib/common.sh"
+
+APPLY=0; SKIP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --skip-previews) SKIP=1 ;;
+    --yes|-y) APPLY=1 ;;
+    --dry-run) ;;
+    *) die "unknown option: $1 (try: mach onboard --help)" ;;
+  esac
+  shift
+done
+
+STATUS=0
+HOST=$(mach_host)
+printf '== mach onboard: %s (%s) ==\n\n1. Prerequisites\n' "$HOST" "$(mach_os)"
+
+ok "bash ${BASH_VERSION%%(*}"
+if PY=$(mach_python); then
+  ok "python3 $("$PY" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])') ($PY)"
+else
+  fail "python3 >= 3.9 not found: install it (Mac: Xcode command line tools provide 3.9)"
+  STATUS=2
+fi
+if command -v git >/dev/null 2>&1; then ok "git $(git --version | awk '{print $3}')"; else fail "git not found"; STATUS=2; fi
+if command -v syncthing >/dev/null 2>&1 || [ -x "$HOME/.local/bin/syncthing" ] || [ -d "/Applications/Syncthing.app" ]; then ok "syncthing present (optional)"; else info "syncthing not found (optional; needed only for synced workspaces)"; fi
+if command -v "${MACH_TMUX:-tmux}" >/dev/null 2>&1; then ok "tmux present (needed for: mach do --bg)"; else info "tmux not found (optional; only 'mach do --bg' needs it)"; fi
+
+printf '\n2. PATH and the mach link\n'
+BIN=${MACH_BIN_DIR:-$HOME/.local/bin}
+case ":$PATH:" in
+  *":$BIN:"*) ok "$(mach_tilde "$BIN") is on PATH" ;;
+  *) warn "$(mach_tilde "$BIN") is not on PATH: add  export PATH=\"$(mach_tilde "$BIN"):\$PATH\"  to your shell profile"; [ "$STATUS" = 2 ] || STATUS=1 ;;
+esac
+if [ "$APPLY" = 1 ]; then
+  bash "$MACH_HOME/install.sh" --apply || { err "install.sh failed"; STATUS=2; }
+else
+  bash "$MACH_HOME/install.sh" || true
+  printf 'preview only: run  mach onboard --apply  (or bash %s --apply) to create the link\n' "$(mach_tilde "$MACH_HOME/install.sh")"
+fi
+
+printf '\n3. Workspace and sync setup\n'
+printf '   active root: %s\n' "$(mach_tilde "$MACH_MF_ROOT")"
+printf '   run mach setup for a guided first setup; Syncthing and Tailscale remain optional and are never configured by mach.\n'
+printf '   To sync, approve devices manually, share this workspace as a separate Syncthing folder, and exclude .git.\n'
+printf '   Record a new login service in inventory/<host>/75-custom-startup-services.md. Check connections with mach scan connections.\n'
+
+if [ "$SKIP" = 1 ]; then
+  printf '\n4. Previews skipped (--skip-previews)\n'
+else
+  printf '\n4. Previews (nothing is written)\n'
+  for step in "inventory" "names" "ai apply" "mcp render"; do
+    printf -- '-- mach %s\n' "$step"
+    # shellcheck disable=SC2086
+    "$MACH_HOME/bin/mach" $step 2>&1 | sed 's/^/   /'
+  done
+fi
+printf '\nnext: mach setup   (workspace and optional scans), mach doctor   (health checks), mach help   (everything else)\n'
+exit "$STATUS"

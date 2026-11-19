@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# mach-summary: Export one tier (personal, org, public) of the machine-flows tree to a staging folder after a content scan
+# mach-group: upkeep
+# mach-flag: --tier | which tier manifest to use | required
+# mach-flag: --status | list only what changed since the last export | off
+# mach-flag: --out | export folder (must be outside the synced tree) | <staging>/publish/<tier>
+# mach-flag: --manifest | use this manifest instead of service-settings/tiers/<tier>.manifest | off
+# mach-flag: --root | the tree to export (default: the machine-flows folder) | off
+# mach-flag: --features | build the manifest from a features index (CSV) instead of a manifest file | off
+# mach-flag: --rules | scan, deny and allow lines for --features (default: publish.rules beside the index) | off
+# mach-writes: yes
+# mach-usage: mach publish --tier NAME [--status] [--manifest FILE | --features CSV [--rules FILE]] [--root DIR] [--out DIR] [--apply]
+# mach-help: A tier is a filtered projection of the whole tree, described by a line-based manifest (include, exclude, map, scan,
+# mach-help: deny, allow; see lib/mach_publish.py). The preview selects the files, scans them (secrets always; machine paths,
+# mach-help: ticket keys and denied names when the manifest asks) and compares with the last export. Secret values are masked.
+# mach-help: --apply writes the export folder and refuses while any finding is open. It never runs git: review the folder,
+# mach-help: then commit and push by hand. Never exports symlinks, .git, .env, keys, tokens or credential-looking names.
+# mach-help: Manifests live in service-settings/tiers/ (local config, not part of this repo); MACH_TIERS_DIR overrides that folder.
+# mach-help: --features reads a features index instead (columns feature, paths, tiers, status, note): a row is exported for a tier
+# mach-help: only when it names the tier AND its status is `ready`; every other row is held back. This repo's own FEATURES.csv works so.
+set -u
+MACH_HOME=${MACH_HOME:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+# shellcheck source=/dev/null
+. "$MACH_HOME/lib/common.sh"
+PY=$(mach_python) || die "python3 >= 3.9 is required"
+exec "$PY" "$MACH_HOME/lib/mach_publish.py" "$@"

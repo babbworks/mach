@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+# mach-summary: Scan machine/workspace/connections, save private reports and share reviewed categories by approval
+# mach-group: upkeep
+# mach-subcommands: catalog machine workspace connections configure share
+# mach-writes: yes configure=yes share=yes
+# mach-flag: --category | machine: scan one inventory category | all
+# mach-flag: --full | machine: include slower size and network checks | light
+# mach-flag: --save-local | machine: keep private scan report under ~/.local/state/mach/scans | off
+# mach-flag: --report | share: saved local report directory to project | none
+# mach-flag: --reviewed | share: confirm report contents were inspected | required with --apply
+# mach-flag: --workspace | configure: select a workspace profile | active workspace
+# mach-flag: --categories | configure: local machine scan categories | current profile
+# mach-flag: --share | configure: categories approved for reviewed sharing | none
+# mach-usage: mach scan catalog [--json]
+# mach-usage: mach scan machine [--category NAME] [--full] [--save-local]
+# mach-usage: mach scan workspace [NAME] [--json]
+# mach-usage: mach scan connections [--json]
+# mach-usage: mach scan configure [--workspace NAME] [--categories LIST] [--share LIST] [--apply]
+# mach-usage: mach scan share [NAME] [--report LOCAL-DIR] [--category NAME ...] [--reviewed] [--apply]
+# mach-flag: --apply | configure: save local scan/sharing preferences; share: copy reviewed approved reports | preview
+# mach-help: Scans run locally. machine delegates to the existing redacting inventory generator and previews by default;
+# mach-help: Categories: system, packages, tools, apps, ai, shell, operations, workspace, connections. Inventory is never applied by mach scan.
+# mach-help: workspace reports only folder metadata and tracking-set counts, not file contents. connections runs mach doctor and
+# mach-help: reports Tailscale state/peer count only; it never prints peer names, addresses, keys or raw command output.
+# mach-help: --save-local stores selected machine reports under ~/.local/state/mach/scans; raw details are never synced.
+# mach-help: share copies only selected Markdown summaries from a saved local report, only for categories allowed by the workspace policy.
+# mach-help: Preview first; --apply also requires --reviewed. Raw inventory files are never shared. Run mach docs --apply afterward.
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import mach_workspace as mw  # noqa: E402
+import mach_common as mc  # noqa: E402
+
+CATEGORIES = {
+    "system": "00", "packages": "20", "tools": "30", "apps": "40",
+    "ai": "50", "shell": "60", "operations": "70", "workspace": "80",
+}
+SCAN_NAMES = tuple(CATEGORIES) + ("connections",)
+
+
+def run_mach(*args):
+    exe = os.path.join(os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "mach")
+    return subprocess.call([exe] + list(args))
+
+
+def save_registry(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    if os.path.islink(path):
+        raise ValueError("refusing to replace a symlinked workspace registry: %s" % path)
+    fd, tmp = tempfile.mkstemp(prefix=".workspaces.", dir=os.path.dirname(path))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def workspace_scan(name=None, as_json=False):
+    data = mw.load()
+    rows = data["workspaces"]
+    if name:
+        rows = [row for row in rows if row.get("name") == name]
+        if not rows:
+            print("mach scan workspace: unknown workspace %s" % name, file=sys.stderr)
+            return 2
+    result = []
+    for row in rows:
+        root = row.get("path", "")
+        exists = os.path.isdir(root)
+        top = []
+        tracking_sets = 0
+        if exists:
+            try:
+                top = sorted(os.listdir(root))
+                for base, dirs, files in os.walk(root):
+                    dirs[:] = [d for d in dirs if d not in (".git", "node_modules", ".venv", "__pycache__", ".stversions", ".cache", ".pytest_cache", ".tox", "vendor", "dist", "build", ".next")]
+                    if "index.csv" in files:
+                        tracking_sets += 1
+            except OSError:
+                exists = False
+        result.append({"name": row.get("name"), "kind": row.get("kind", "personal"), "active": row.get("name") == data.get("active"),
+                       "path": root, "exists": exists, "git": os.path.exists(os.path.join(root, ".git")) if exists else False,
+                       "top_level_entries": len(top), "tracking_sets": tracking_sets})
+    if as_json or os.environ.get("MACH_JSON") == "1":
+        print(json.dumps({"workspaces": result}, indent=2))
+    elif not result:
+        print("No workspaces registered.")
+    else:
+        for row in result:
+            print("%s %s: %s; git=%s; top-level entries=%d; tracking sets=%d" % (
+                "active" if row["active"] else "workspace", row["name"], "present" if row["exists"] else "missing",
+                "yes" if row["git"] else "no", row["top_level_entries"], row["tracking_sets"]))
+    return 1 if any(not row["exists"] for row in result) else 0
+
+
+def connections(as_json=False):
+    if as_json:
+        exe = os.path.join(os.environ.get("MACH_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "mach")
+        doctor = subprocess.run([exe, "doctor", "--json"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:
+            doctor_data = json.loads(doctor.stdout)
+        except ValueError:
+            doctor_data = {"error": "doctor output was unavailable"}
+        rc = doctor.returncode
+    else:
+        rc = run_mach("doctor", "--quiet")
+    tailscale = {"installed": False, "state": "not-installed", "peers": None}
+    exe = None
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        path = os.path.join(directory, "tailscale")
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            exe = path
+            break
+    if exe:
+        tailscale["installed"] = True
+        try:
+            out = subprocess.check_output([exe, "status", "--json"], stderr=subprocess.DEVNULL, timeout=5, text=True)
+            payload = json.loads(out)
+            tailscale["state"] = payload.get("BackendState", "unknown")
+            tailscale["peers"] = len(payload.get("Peer", {}))
+        except (OSError, subprocess.SubprocessError, ValueError):
+            tailscale["state"] = "unavailable"
+    if as_json:
+        print(json.dumps({"doctor": doctor_data, "tailscale": tailscale}, indent=2))
+    else:
+        print("Tailscale: %s; peer count: %s" % (tailscale["state"], tailscale["peers"] if tailscale["peers"] is not None else "not checked"))
+        print("Syncthing, services and local health are reported by mach doctor above.")
+    return max(rc, 1 if tailscale["installed"] and tailscale["state"] not in ("Running", "NeedsLogin") else 0)
+
+
+def save_local_scan(selected, full):
+    root = os.environ.get("MACH_MF_ROOT") or os.path.join(os.path.expanduser("~"), "machine-flows")
+    script = os.path.join(root, "scripts", "inventory-macos.sh" if sys.platform == "darwin" else "inventory-linux.sh")
+    if not os.path.isfile(script):
+        raise ValueError("inventory generator not found in active workspace: %s" % script)
+    id_file = os.path.join(os.path.expanduser("~"), ".config", "mach", "machine-id")
+    try:
+        with open(id_file, encoding="utf-8") as stream:
+            identity = stream.read().strip()
+    except OSError:
+        identity = os.environ.get("MACH_HOST") or os.environ.get("MACH_MACHINE") or socket.gethostname().split(".")[0]
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", identity):
+        raise ValueError("machine ID contains unsafe path characters")
+    prefixes = {CATEGORIES[name] for name in selected if name in CATEGORIES}
+    if not prefixes:
+        raise ValueError("--save-local needs at least one machine category; connection status is available from mach scan connections")
+    state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    base = os.path.join(state, "mach", "scans")
+    registry = mw.load()
+    for workspace in registry["workspaces"]:
+        work_root = os.path.realpath(workspace.get("path", ""))
+        candidate = os.path.realpath(base)
+        if work_root and (candidate == work_root or candidate.startswith(work_root + os.sep) or work_root.startswith(candidate + os.sep)):
+            raise ValueError("local scan storage resolves inside workspace %s; choose an unsynced XDG_STATE_HOME" % workspace.get("name"))
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    os.chmod(base, 0o700)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    report_root = tempfile.mkdtemp(prefix=stamp + "-", dir=base)
+    os.chmod(report_root, 0o700)
+    with tempfile.TemporaryDirectory(prefix="mach-scan-") as temp_root:
+        env = os.environ.copy()
+        if not full:
+            env.update({"SKIP_SIZES": "1", "SKIP_NET": "1", "SKIP_BREW_DOCTOR": "1"})
+        try:
+            result = subprocess.run(["bash", script, "--identity", identity, temp_root], env=env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600)
+        except subprocess.SubprocessError as error:
+            shutil.rmtree(report_root)
+            raise ValueError("inventory scan did not finish: %s" % error)
+        if result.returncode:
+            shutil.rmtree(report_root)
+            raise ValueError("inventory scan failed (exit %d): %s" % (result.returncode, result.stderr[-500:]))
+        generated = os.path.join(temp_root, identity)
+        if not os.path.isdir(generated):
+            generated = next((os.path.join(temp_root, name) for name in os.listdir(temp_root)
+                              if os.path.isdir(os.path.join(temp_root, name))), "")
+        if not generated:
+            shutil.rmtree(report_root)
+            raise ValueError("inventory scan produced no report directory")
+        out = os.path.join(report_root, identity)
+        os.makedirs(out, mode=0o700)
+        all_selected = set(selected) >= set(CATEGORIES)
+        for filename in os.listdir(generated):
+            source = os.path.join(generated, filename)
+            if os.path.isdir(source):
+                if all_selected and filename == "raw":
+                    shutil.copytree(source, os.path.join(out, filename))
+            elif filename == "README.md" or all_selected or any(filename.startswith(prefix + "-") for prefix in prefixes):
+                shutil.copy2(source, out)
+    print("saved private scan report: %s (workspace and sync folders untouched)" % out)
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="mach scan")
+    sub = ap.add_subparsers(dest="command", required=True)
+    cat = sub.add_parser("catalog"); cat.add_argument("--json", action="store_true")
+    machine = sub.add_parser("machine"); machine.add_argument("--category", choices=sorted(SCAN_NAMES)); machine.add_argument("--full", action="store_true"); machine.add_argument("--save-local", action="store_true")
+    workspace = sub.add_parser("workspace"); workspace.add_argument("name", nargs="?"); workspace.add_argument("--json", action="store_true")
+    conn = sub.add_parser("connections"); conn.add_argument("--json", action="store_true")
+    configure = sub.add_parser("configure")
+    configure.add_argument("--workspace")
+    configure.add_argument("--categories")
+    configure.add_argument("--share")
+    configure.add_argument("--apply", action="store_true")
+    share = sub.add_parser("share")
+    share.add_argument("name", nargs="?")
+    share.add_argument("--report")
+    share.add_argument("--category", action="append", choices=sorted(CATEGORIES))
+    share.add_argument("--reviewed", action="store_true")
+    share.add_argument("--apply", action="store_true")
+    args = ap.parse_args(argv)
+    if args.command == "catalog":
+        rows = [{"name": name, "coverage": coverage} for name, coverage in [
+            ("system", "OS, CPU, memory, disks, mounts, filesystems"),
+            ("packages", "installed and managed packages"), ("tools", "developer CLIs, languages and toolchains"),
+            ("apps", "desktop apps, editors and extensions"), ("ai", "AI tools, plugins, skills and MCP metadata"),
+            ("shell", "shell and dotfile metadata"), ("operations", "services, schedules and network metadata"),
+            ("workspace", "repos, environments and workflow folders"),
+            ("connections", "Tailscale state and Syncthing/local connection health")]]
+        if args.json or os.environ.get("MACH_JSON") == "1": print(json.dumps(rows, indent=2))
+        else:
+            for row in rows: print("%-12s %s" % (row["name"], row["coverage"]))
+        print("Scans are local by default. Exports require an approved category, report review and explicit apply.")
+        return 0
+    if args.command == "workspace":
+        return workspace_scan(args.name, args.json)
+    if args.command == "connections":
+        return connections(args.json)
+    try:
+        registry_path = mw.registry_path()
+        data = mw.load(registry_path)
+        if args.command in ("configure", "share"):
+            name = getattr(args, "workspace", None) or getattr(args, "name", None) or data.get("active")
+            row = next((item for item in data["workspaces"] if item.get("name") == name), None)
+            if not row:
+                raise ValueError("no matching workspace; register one with mach workspace add")
+            prefs = row.setdefault("preferences", {})
+            if args.command == "share":
+                approved = set(prefs.get("share_categories", []))
+                print("workspace %s: approved scan-sharing categories: %s" % (name, ", ".join(sorted(approved)) or "none"))
+                if not args.report:
+                    print("No scan data is sent or copied by this command.")
+                    return 0
+                requested = set(args.category or (approved & set(CATEGORIES)))
+                if not requested:
+                    raise ValueError("no categories selected for sharing; set a policy with mach scan configure --share LIST --apply")
+                blocked = requested - approved
+                if blocked:
+                    raise ValueError("sharing policy does not approve: %s" % ", ".join(sorted(blocked)))
+                state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+                safe_root = os.path.realpath(os.path.join(state_home, "mach", "scans"))
+                for workspace in data["workspaces"]:
+                    work_root = os.path.realpath(workspace.get("path", ""))
+                    if work_root and (safe_root == work_root or safe_root.startswith(work_root + os.sep) or work_root.startswith(safe_root + os.sep)):
+                        raise ValueError("scan storage overlaps workspace %s; use an unsynced XDG_STATE_HOME" % workspace.get("name"))
+                report = os.path.realpath(os.path.expanduser(args.report))
+                if not report.startswith(safe_root + os.sep) or not os.path.isdir(report):
+                    raise ValueError("report must be a saved local scan folder under %s" % safe_root)
+                id_file = os.path.join(os.path.expanduser("~"), ".config", "mach", "machine-id")
+                try:
+                    with open(id_file, encoding="utf-8") as stream: identity = stream.read().strip()
+                except OSError:
+                    identity = os.environ.get("MACH_HOST") or os.environ.get("MACH_MACHINE") or socket.gethostname().split(".")[0]
+                files = sorted(filename for filename in os.listdir(report) if filename.endswith(".md") and any(filename.startswith(CATEGORIES[c] + "-") for c in requested))
+                if not files:
+                    raise ValueError("saved report has no Markdown files in the selected categories")
+                stamp = os.path.basename(os.path.dirname(report))
+                root = os.path.realpath(row["path"])
+                if not os.path.isdir(root):
+                    raise ValueError("workspace folder is missing: %s" % root)
+                target_parent = os.path.join(root, "inventory", identity, "scan-shares")
+                target = os.path.join(target_parent, stamp)
+                real_parent = os.path.realpath(target_parent)
+                if real_parent != root and not real_parent.startswith(root + os.sep):
+                    raise ValueError("share destination resolves outside the workspace")
+                print("would share reviewed Markdown categories %s to %s" % (", ".join(sorted(requested)), target))
+                for filename in files: print("  %s" % filename)
+                if not args.apply or mc.env_flag("MACH_DRY_RUN"):
+                    print("preview only; inspect the local report, then repeat with --reviewed --apply")
+                    return 0
+                if not args.reviewed:
+                    raise ValueError("--apply requires --reviewed after you inspect the saved report")
+                if os.path.lexists(target):
+                    raise ValueError("share target already exists: %s" % target)
+                os.makedirs(target_parent, mode=0o755, exist_ok=True)
+                if os.path.realpath(target_parent) != real_parent:
+                    raise ValueError("share destination changed during preview")
+                staging = tempfile.mkdtemp(prefix=".scan-share-", dir=target_parent)
+                try:
+                    for filename in files:
+                        shutil.copy2(os.path.join(report, filename), os.path.join(staging, filename))
+                    os.chmod(staging, 0o755)
+                    os.replace(staging, target)
+                finally:
+                    if os.path.isdir(staging):
+                        shutil.rmtree(staging)
+                print("shared %d reviewed report file(s); run mach docs --apply to update the workspace docs index" % len(files))
+                return 0
+            categories = [x.strip() for x in (args.categories or "").split(",") if x.strip() and x.strip() != "none"]
+            shared = [x.strip() for x in (args.share or "").split(",") if x.strip() and x.strip() != "none"]
+            if args.categories is None and args.share is None:
+                raise ValueError("set --categories and/or --share; use 'none' to clear a selection")
+            unknown = sorted((set(categories) | set(shared)) - set(SCAN_NAMES))
+            if unknown:
+                raise ValueError("unknown categories: %s" % ", ".join(unknown))
+            if args.categories is not None:
+                prefs["scan_categories"] = categories
+            if args.share is not None:
+                prefs["share_categories"] = shared
+            apply = args.apply and not mc.env_flag("MACH_DRY_RUN")
+            if apply:
+                save_registry(registry_path, data)
+                print("saved local scan profile for %s; sharing approval applies only to those categories" % name)
+            else:
+                print("would set local scan categories for %s: %s" % (name, ", ".join(prefs.get("scan_categories", [])) or "none"))
+                print("would set local sharing policy: %s" % (", ".join(prefs.get("share_categories", [])) or "none"))
+                print("preview only: add --apply to save")
+            return 0
+        selected = [args.category] if args.category else None
+        active = next((item for item in data["workspaces"] if item.get("name") == data.get("active")), None)
+        if selected is None and active and "scan_categories" in active.get("preferences", {}):
+            selected = active["preferences"].get("scan_categories", [])
+        if selected is None:
+            selected = list(CATEGORIES)
+        if not selected:
+            print("No scan categories selected. Configure them with mach scan configure --categories LIST --apply; skip all with --categories none.")
+            return 0
+        if args.save_local:
+            return save_local_scan(selected, args.full)
+        print("Local scan preview only; mach scan does not write inventory into a workspace or transmit results.")
+        machine_selected = [name for name in selected if name in CATEGORIES]
+        connection_selected = "connections" in selected
+        rc = 0
+        if set(machine_selected) == set(CATEGORIES):
+            rc = run_mach("inventory", "--full" if args.full else "--light", "--diff")
+        else:
+            for category in machine_selected:
+                print("\n== %s ==" % category)
+                rc = max(rc, run_mach("inventory", "--full" if args.full else "--light", "--section", CATEGORIES[category], "--diff"))
+        if connection_selected:
+            print("\n== connections ==")
+            rc = max(rc, connections())
+        return rc
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print("mach scan: %s" % error, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
